@@ -1,0 +1,7 @@
+# runtime data: screenshots + text captured from the screen (private)
+state/
+output/
+# compiled binaries (rebuild with swiftc, see README)
+helper
+reviewer
+.DS_Store

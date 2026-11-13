@@ -1,0 +1,8 @@
+#!/bin/bash
+# Live view of the code reviewer: activity + every reply, in real time.
+P=~/Library/LaunchAgents/com.fernando.screenpipe-review.plist
+launchctl list | grep -q com.fernando.screenpipe-review || launchctl load "$P"
+clear
+echo "Live code review is watching MeowDisplay. Ctrl+C stops this view; the reviewer keeps running."
+tail -n 30 -F ~/screenpipe-review/output/feed.log ~/screenpipe-review/state/run.log 2>/dev/null |
+  grep --line-buffered -vE '^==> |^$|reviewed: no new findings|could not create image'
