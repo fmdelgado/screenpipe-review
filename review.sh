@@ -72,45 +72,108 @@ if [ ! -s "$SHOT" ]; then
   exit 0
 fi
 
-TEXT=$("$DIR/helper" ocr "$SHOT" 2>/dev/null || true)
-printf '%s' "$TEXT" > "$STATE/current.txt"
+# If our own Live Solver terminal is visible on the watched monitor, mask it out
+# so streaming our own answer can never trigger a self-capture feedback loop.
+if [ -n "$SCREEN" ] && [ -z "${CAPTURE_IMAGE:-}" ]; then
+  if "$DIR/helper" mask "$SHOT" "$STATE/screen_masked.png" "$SCREEN" "Live Solver" 2>/dev/null; then
+    mv "$STATE/screen_masked.png" "$SHOT"
+  fi
+fi
 
-# Dual change detection: sensitive new-line text diff + fast visual grid diff
+# Fast Pixel-First + Jitter-Resistant Dual Change Detection
 CHANGE_REASON=""
+TEXT=""
 if [ "$FORCE_REVIEW" = "1" ]; then
   CHANGE_REASON="manual trigger"
-elif [ ! -f "$STATE/last_reviewed.txt" ]; then
+elif [ ! -f "$STATE/last_reviewed.png" ] || [ ! -f "$STATE/last_reviewed.txt" ]; then
   CHANGE_REASON="initial capture"
 else
-  TEXT_CHANGE=$(python3 -I -c '
+  VINFO=$("$DIR/helper" vdiff-cells "$STATE/last_reviewed.png" "$SHOT" 2>/dev/null || echo "99999	100")
+  VCELLS="${VINFO%%$'\t'*}"
+  VPCT="${VINFO#*$'\t'}"
+  if [ "${VCELLS:-0}" -eq 0 ] 2>/dev/null; then
+    # Zero visual pixels changed below menu bar -> skip Vision OCR & Claude completely
+    status "watching"
+    exit 0
+  elif [ "${VPCT:-0}" -ge 2 ] 2>/dev/null; then
+    CHANGE_REASON="visual changed (${VPCT}%)"
+  else
+    # Small localized visual change (e.g. new line, small edit, or countdown timer):
+    # verify via OCR whether meaningful non-volatile text actually changed.
+    TEXT=$("$DIR/helper" ocr "$SHOT" 2>/dev/null || true)
+    printf '%s' "$TEXT" > "$STATE/current.txt"
+    TEXT_CHANGE=$(python3 -I -c '
+from collections import Counter
 import re, sys
-TIME_RE = re.compile(r"^[\d:.\sAPMapm/,-]+$")
-def load_lines(path):
-    out = set()
+
+CLOCK_RE = re.compile(r"\b\d{1,2}:\d{2}(?::\d{2})?(?:\s*[APMapm]{2})?\b")
+WEEKDAY_RE = re.compile(r"\b(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{1,2}\b.*", re.I)
+REL_AGE_RE = re.compile(r"\b\d+\s*(?:s|sec|secs|second|seconds|m|min|mins|minute|minutes|h|hr|hrs|hour|hours)\s+ago\b", re.I)
+UI_NOISE_RE = re.compile(r"(Live Solver|───\s*\d{2}:\d{2}:\d{2}|●\s*watching|◌\s*(?:solving|searching web)|⏸\s*paused|\[w\]\s*web)", re.I)
+TOKEN_RE = re.compile(r"[A-Za-z0-9_+#=^]+")
+
+def load_clean_lines(path):
+    lines = []
     try:
         with open(path, encoding="utf-8", errors="replace") as f:
             for l in f:
                 s = l.strip()
-                if len(s) > 2 and not TIME_RE.match(s):
-                    out.add(s)
+                if not s or UI_NOISE_RE.search(s):
+                    continue
+                s = WEEKDAY_RE.sub(" ", s)
+                s = CLOCK_RE.sub(" ", s)
+                s = REL_AGE_RE.sub(" ", s)
+                s = re.sub(r"\s+", " ", s).strip()
+                if s:
+                    lines.append(s)
     except OSError:
         pass
-    return out
-a, b = load_lines(sys.argv[1]), load_lines(sys.argv[2])
-added = b - a
-removed = a - b
-sim = int(100 * len(a & b) / max(1, len(a | b))) if (a or b) else 100
-max_delta = max((len(x) for x in (added | removed)), default=0)
-changed = (sim < 95) or (len(added) >= 2) or (len(removed) >= 2) or (max_delta >= 12)
-print(f"{1 if changed else 0} {sim} {len(added)} {len(removed)}")
-' "$STATE/last_reviewed.txt" "$STATE/current.txt")
-  read -r TXT_CHANGED SIM ADDED_CNT REMOVED_CNT <<< "$TEXT_CHANGE"
-  if [ "$TXT_CHANGED" = "1" ]; then
-    CHANGE_REASON="text changed (sim ${SIM}%, +${ADDED_CNT}/-${REMOVED_CNT} lines)"
-  elif [ -f "$STATE/last_reviewed.png" ]; then
-    VDIFF=$("$DIR/helper" vdiff "$STATE/last_reviewed.png" "$SHOT" 2>/dev/null || echo "100")
-    if [ "${VDIFF:-0}" -ge 2 ] 2>/dev/null; then
-      CHANGE_REASON="visual changed (${VDIFF}%)"
+    return lines
+
+def to_tokens(lines):
+    c = Counter()
+    for s in lines:
+        for tok in TOKEN_RE.findall(s.lower()):
+            if len(tok) >= 2 or tok.isdigit():
+                c[tok] += 1
+    return c
+
+lines_a = load_clean_lines(sys.argv[1])
+lines_b = load_clean_lines(sys.argv[2])
+own_lines = set(load_clean_lines(sys.argv[3])) if len(sys.argv) > 3 else set()
+
+# Remove lines belonging to our own last rendered solution (self-capture fallback guard)
+lines_a = [l for l in lines_a if l not in own_lines]
+lines_b = [l for l in lines_b if l not in own_lines]
+
+wa = to_tokens(lines_a)
+wb = to_tokens(lines_b)
+
+added = wb - wa
+removed = wa - wb
+add_cnt = sum(added.values())
+rem_cnt = sum(removed.values())
+delta_words = add_cnt + rem_cnt
+add_chars = sum(len(w) * n for w, n in added.items())
+rem_chars = sum(len(w) * n for w, n in removed.items())
+digit_changed = any(any(ch.isdigit() for ch in w) for w in (set(added) | set(removed)))
+
+union_cnt = sum((wa | wb).values())
+inter_cnt = sum((wa & wb).values())
+sim = int(100 * inter_cnt / max(1, union_cnt)) if union_cnt else 100
+
+changed = (
+    (delta_words >= 3)
+    or (add_chars >= 10)
+    or (rem_chars >= 10)
+    or (digit_changed and delta_words >= 2)
+    or (sim < 95 and delta_words >= 2)
+)
+print(f"{1 if changed else 0} {sim} {add_cnt} {rem_cnt}")
+' "$STATE/last_reviewed.txt" "$STATE/current.txt" "$OUT/latest.md")
+    read -r TXT_CHANGED SIM ADDED_CNT REMOVED_CNT <<< "$TEXT_CHANGE"
+    if [ "$TXT_CHANGED" = "1" ]; then
+      CHANGE_REASON="text changed (sim ${SIM}%, +${ADDED_CNT}/-${REMOVED_CNT} words)"
     fi
   fi
 fi
@@ -118,6 +181,12 @@ fi
 if [ -z "$CHANGE_REASON" ]; then
   status "watching"
   exit 0
+fi
+
+# Run OCR now if we skipped it on the fast path (initial / manual / visual-change trigger)
+if [ -z "$TEXT" ]; then
+  TEXT=$("$DIR/helper" ocr "$SHOT" 2>/dev/null || true)
+  printf '%s' "$TEXT" > "$STATE/current.txt"
 fi
 
 # Live web-search toggle: state/web_enabled wins when managed by live-review; default ON (1)

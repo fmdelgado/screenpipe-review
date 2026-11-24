@@ -806,14 +806,14 @@ def read_file(p):
     except OSError:
         return ""
 
-# Wait for initial solve + fast follow-up skip to settle in idle watching
-ok1 = wait_for(lambda: read_file(count_file) == "1" and read_file(os.path.join(state_dir, "status")) == "watching" and read_file(os.path.join(state_dir, "did_solve")) == "0")
+# Wait for initial solve to finish and lock to release (now calmly idle watching)
+ok1 = wait_for(lambda: read_file(count_file) == "1" and read_file(os.path.join(state_dir, "status")) == "watching" and not os.path.exists(os.path.join(state_dir, "lock.d")))
 # Press 'w' to toggle web OFF on the go
 os.write(master, b"w")
 ok_w_off = wait_for(lambda: read_file(os.path.join(state_dir, "web_enabled")) == "0", timeout=3.0)
 # Press Space to force immediate re-solve with web OFF
 os.write(master, b" ")
-ok_force = wait_for(lambda: read_file(count_file) == "2" and read_file(os.path.join(state_dir, "status")) == "watching" and read_file(os.path.join(state_dir, "did_solve")) == "0", timeout=8.0)
+ok_force = wait_for(lambda: read_file(count_file) == "2" and read_file(os.path.join(state_dir, "status")) == "watching" and not os.path.exists(os.path.join(state_dir, "lock.d")), timeout=8.0)
 # Press 'w' again to toggle web back ON
 os.write(master, b"w")
 ok_w_on = wait_for(lambda: read_file(os.path.join(state_dir, "web_enabled")) == "1", timeout=3.0)
@@ -846,6 +846,130 @@ assert_not_contains "$CALL2_LINE" "WebSearch" "PTY call 2 (after pressing [w] + 
 sleep 0.2
 STRAY6=$(pgrep -fl "$TMPBASE" 2>/dev/null || true)
 assert_eq "$STRAY6" "" "no stray background processes left after all live-review runs"
+
+echo
+echo "=== Task 7: anti-spam guarantees on unchanged / noisy screens ==="
+
+swift - "$TMPBASE" <<'SWIFT'
+import Foundation
+import AppKit
+
+func renderPNG(path: String, lines: [String], cursor: Bool = false) {
+    let w = 900, h = 900
+    let rep = NSBitmapImageRep(
+        bitmapDataPlanes: nil, pixelsWide: w, pixelsHigh: h,
+        bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
+        colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0
+    )!
+    NSGraphicsContext.saveGraphicsState()
+    NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: rep)
+    NSColor.white.setFill()
+    NSRect(x: 0, y: 0, width: w, height: h).fill()
+    let attrs: [NSAttributedString.Key: Any] = [
+        .font: NSFont.monospacedSystemFont(ofSize: 18, weight: .regular),
+        .foregroundColor: NSColor.black
+    ]
+    for (idx, line) in lines.enumerated() {
+        let y = CGFloat(h - 40 - idx * 24)
+        NSString(string: line).draw(at: NSPoint(x: 30, y: y), withAttributes: attrs)
+    }
+    if cursor {
+        NSColor.black.setFill()
+        NSRect(x: 340, y: h - 40, width: 2, height: 20).fill()
+    }
+    NSGraphicsContext.restoreGraphicsState()
+    try! rep.representation(using: .png, properties: [:])!.write(to: URL(fileURLWithPath: path))
+}
+
+let base = CommandLine.arguments[1]
+let staticLines = (1...20).map { "Static quiz context line number \($0) on screen" }
+renderPNG(path: "\(base)/t7_base.png", lines: staticLines + ["Time remaining: 14:59"])
+renderPNG(path: "\(base)/t7_cursor.png", lines: staticLines + ["Time remaining: 14:59"], cursor: true)
+renderPNG(path: "\(base)/t7_timer_tick.png", lines: staticLines + ["Time remaining: 14:58"])
+renderPNG(path: "\(base)/t7_self_echo.png", lines: staticLines + ["Time remaining: 14:58", "Live Solver · watching screen 1", "Answer: Option C is correct"])
+renderPNG(path: "\(base)/t7_real_change.png", lines: staticLines + ["Time remaining: 14:57", "Question 2: Solve 3x + 5 = 20"])
+SWIFT
+
+# 7a. helper vdiff-cells distinguishes zero/cursor noise from real changes
+VC_SAME=$("$ROOT/helper" vdiff-cells "$TMPBASE/t7_base.png" "$TMPBASE/t7_base.png" 2>/dev/null)
+assert_eq "$VC_SAME" "$(printf '0\t0')" "helper vdiff-cells returns 0 cells on identical image"
+
+VC_CUR=$("$ROOT/helper" vdiff-cells "$TMPBASE/t7_base.png" "$TMPBASE/t7_cursor.png" 2>/dev/null)
+assert_eq "$VC_CUR" "$(printf '0\t0')" "helper vdiff-cells returns 0 cells on blinking cursor"
+
+VC_ADD=$("$ROOT/helper" vdiff-cells "$TMPBASE/t7_base.png" "$TMPBASE/t7_real_change.png" 2>/dev/null)
+VC_ADD_CELLS="${VC_ADD%%$'\t'*}"
+assert_ge "$VC_ADD_CELLS" "10" "helper vdiff-cells detects new question line (>=10 cells)"
+
+# 7b. review.sh skips blinking cursor, ticking countdown timer, and self-output echo, but triggers on real new question
+T7_STATE="$TMPBASE/t7_state"
+T7_OUT="$TMPBASE/t7_out"
+T7_COUNT="$TMPBASE/t7_count"
+echo 0 > "$T7_COUNT"
+T7_CLAUDE="$TMPBASE/t7-claude"
+cat > "$T7_CLAUDE" <<EOF
+#!/bin/bash
+cat >/dev/null
+c=\$(cat "$T7_COUNT")
+echo \$((c + 1)) > "$T7_COUNT"
+echo "Answer: Option C is correct"
+EOF
+chmod +x "$T7_CLAUDE"
+
+STATE_DIR="$T7_STATE" OUT_DIR="$T7_OUT" CAPTURE_IMAGE="$TMPBASE/t7_base.png" \
+  CLAUDE_BIN="$T7_CLAUDE" NO_NOTIFY=1 "$ROOT/review.sh"
+assert_eq "$(cat "$T7_COUNT")" "1" "initial capture solves once"
+
+STATE_DIR="$T7_STATE" OUT_DIR="$T7_OUT" CAPTURE_IMAGE="$TMPBASE/t7_cursor.png" \
+  CLAUDE_BIN="$T7_CLAUDE" NO_NOTIFY=1 "$ROOT/review.sh"
+assert_eq "$(cat "$T7_COUNT")" "1" "blinking cursor does NOT re-trigger stream"
+
+STATE_DIR="$T7_STATE" OUT_DIR="$T7_OUT" CAPTURE_IMAGE="$TMPBASE/t7_timer_tick.png" \
+  CLAUDE_BIN="$T7_CLAUDE" NO_NOTIFY=1 "$ROOT/review.sh"
+assert_eq "$(cat "$T7_COUNT")" "1" "countdown timer tick (14:59 -> 14:58) does NOT re-trigger stream"
+
+STATE_DIR="$T7_STATE" OUT_DIR="$T7_OUT" CAPTURE_IMAGE="$TMPBASE/t7_self_echo.png" \
+  CLAUDE_BIN="$T7_CLAUDE" NO_NOTIFY=1 "$ROOT/review.sh"
+assert_eq "$(cat "$T7_COUNT")" "1" "Live Solver own UI/reply lines do NOT self-trigger stream"
+
+STATE_DIR="$T7_STATE" OUT_DIR="$T7_OUT" CAPTURE_IMAGE="$TMPBASE/t7_real_change.png" \
+  CLAUDE_BIN="$T7_CLAUDE" NO_NOTIFY=1 "$ROOT/review.sh"
+assert_eq "$(cat "$T7_COUNT")" "2" "real new question still triggers immediately"
+
+# 7c. live-review running for multiple 1s poll intervals on static screen streams ONCE and stays silent
+T7L_STATE="$TMPBASE/t7l_state"
+T7L_OUT="$TMPBASE/t7l_out"
+T7L_COUNT="$TMPBASE/t7l_count"
+T7L_STDOUT="$TMPBASE/t7l_stdout.log"
+echo 0 > "$T7L_COUNT"
+T7L_CLAUDE="$TMPBASE/t7l-claude"
+cat > "$T7L_CLAUDE" <<EOF
+#!/bin/bash
+cat >/dev/null
+c=\$(cat "$T7L_COUNT")
+echo \$((c + 1)) > "$T7L_COUNT"
+echo "Single answer for static screen"
+EOF
+chmod +x "$T7L_CLAUDE"
+
+(
+  cd "$TMPBASE" &&
+  STATE_DIR="$T7L_STATE" OUT_DIR="$T7L_OUT" CAPTURE_IMAGE="$TMPBASE/t7_base.png" \
+  CLAUDE_BIN="$T7L_CLAUDE" NO_NOTIFY=1 TERM=dumb \
+  exec "$TMPBASE/bin/live-review" --interval 1 >"$T7L_STDOUT" 2>&1
+) &
+LR7_PID=$!
+sleep 3.5
+kill -TERM "$LR7_PID" 2>/dev/null || true
+wait "$LR7_PID" 2>/dev/null || true
+
+assert_eq "$(cat "$T7L_COUNT")" "1" "live-review over 3+ poll ticks on static screen calls Claude only ONCE"
+ANS_OCC=$(grep -c "Single answer for static screen" "$T7L_STDOUT" 2>/dev/null || echo 0)
+assert_eq "$ANS_OCC" "1" "live-review streams answer only ONCE while screen is unchanged"
+
+sleep 0.2
+STRAY7=$(pgrep -fl "$TMPBASE" 2>/dev/null || true)
+assert_eq "$STRAY7" "" "no stray background processes left after Task 7"
 
 echo
 echo "Summary: $PASS passed, $FAIL failed"

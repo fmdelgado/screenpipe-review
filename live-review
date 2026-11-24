@@ -163,8 +163,14 @@ is_paused() {
   [ "$v" = "1" ]
 }
 
+LAST_STATUS=""
+
 print_header() {
-  [ "$INTERACTIVE" = "1" ] && clear
+  LAST_STATUS=""
+  if [ "$INTERACTIVE" = "1" ]; then
+    printf '\033]0;Live Solver\007'
+    clear
+  fi
   printf '\033[2mLive Solver · watching %s · [w] web  [Space] solve  [p] pause  [c] clear  [q] quit\033[0m\n' "$WATCH_DESC"
 }
 
@@ -172,8 +178,10 @@ draw_status() {
   local label="$1"
   local wl
   wl=$(web_label)
-  if [ "$INTERACTIVE" = "1" ]; then
-    printf '\r\033[K\033[2m%s · web %s\033[0m' "$label" "$wl"
+  local full="$label · web $wl"
+  if [ "$INTERACTIVE" = "1" ] && [ "$full" != "$LAST_STATUS" ]; then
+    LAST_STATUS="$full"
+    printf '\r\033[K\033[2m%s\033[0m' "$full"
   fi
 }
 
@@ -361,6 +369,11 @@ while true; do
   DID_SOLVE=$(cat "$STATE/did_solve" 2>/dev/null || echo "0")
   CUR_ST=$(cat "$STATE/status" 2>/dev/null || echo "watching")
 
+  # Force footer redraw cleanly below a newly streamed answer
+  if [ "$DID_SOLVE" = "1" ]; then
+    LAST_STATUS=""
+  fi
+
   if is_paused; then
     draw_status "⏸ paused"
   else
@@ -373,11 +386,6 @@ while true; do
 
   if [ "$QUEUED_FORCE" = "1" ]; then
     FORCE_NEXT=1
-    continue
-  fi
-
-  # Immediately re-check once after solving to catch screen changes made mid-answer
-  if [ "$DID_SOLVE" = "1" ] && ! is_paused; then
     continue
   fi
 

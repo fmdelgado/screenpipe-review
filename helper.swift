@@ -1,9 +1,11 @@
-// helper winid <AppName>          -> prints CGWindowID of the app's largest on-screen window
-// helper ocr <image.png>          -> prints text recognized by macOS Vision (on-device)
-// helper screens                  -> lists active displays (1-based index matching screencapture -D)
-// helper screen <target>          -> resolves index (1, 2), role (builtin, external, main, secondary), or name substring
-// helper vdiff <imgA> <imgB>      -> prints integer % (0-100) of non-menubar visual grid cells that changed
-// helper prep <src> <dst> [maxpx] -> downscales image to max dimension (default 1920) and writes JPEG/PNG
+// helper winid <AppName>                    -> prints CGWindowID of the app's largest on-screen window
+// helper ocr <image.png>                    -> prints text recognized by macOS Vision (on-device)
+// helper screens                            -> lists active displays (1-based index matching screencapture -D)
+// helper screen <target>                    -> resolves index (1, 2), role (builtin, external, main, secondary), or name substring
+// helper vdiff <imgA> <imgB>                -> prints integer % (0-100) of non-menubar visual grid cells that changed
+// helper vdiff-cells <imgA> <imgB>          -> prints "<changed_cells>\t<pct>" on a 240x150 non-menubar grayscale grid
+// helper mask <src> <dst> <screen> <title>  -> masks any on-screen window matching <title> on <screen> (exit 1 if none)
+// helper prep <src> <dst> [maxpx]           -> downscales image to max dimension (default 1920) and writes JPEG/PNG
 import Foundation
 import CoreGraphics
 import ImageIO
@@ -138,8 +140,73 @@ func prepImage(srcPath: String, dstPath: String, maxDim: Int) -> Bool {
     }
 }
 
+func maskWindowOnDisplay(srcPath: String, dstPath: String, screenTarget: String, titleSubstr: String) -> Bool {
+    let displays = activeDisplays()
+    guard let disp = resolveDisplay(screenTarget, in: displays) else { return false }
+    let dBounds = CGDisplayBounds(disp.id)
+    let opts: CGWindowListOption = [.optionOnScreenOnly, .excludeDesktopElements]
+    let list = CGWindowListCopyWindowInfo(opts, kCGNullWindowID) as? [[String: Any]] ?? []
+
+    var maskRects: [CGRect] = []
+    for w in list {
+        guard (w[kCGWindowLayer as String] as? Int) == 0,
+              let name = w[kCGWindowName as String] as? String,
+              name.localizedCaseInsensitiveContains(titleSubstr),
+              let b = w[kCGWindowBounds as String] as? [String: Double] else { continue }
+        let wr = CGRect(
+            x: b["X"] ?? 0,
+            y: b["Y"] ?? 0,
+            width: b["Width"] ?? 0,
+            height: b["Height"] ?? 0
+        )
+        let inter = wr.intersection(dBounds)
+        if !inter.isNull && inter.width > 10 && inter.height > 10 {
+            maskRects.append(inter)
+        }
+    }
+    guard !maskRects.isEmpty, let cg = loadCGImage(srcPath) else { return false }
+
+    let imgW = cg.width
+    let imgH = cg.height
+    let scaleX = Double(imgW) / max(1.0, Double(dBounds.width))
+    let scaleY = Double(imgH) / max(1.0, Double(dBounds.height))
+
+    let cs = CGColorSpaceCreateDeviceRGB()
+    guard let ctx = CGContext(
+        data: nil,
+        width: imgW,
+        height: imgH,
+        bitsPerComponent: 8,
+        bytesPerRow: 0,
+        space: cs,
+        bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue
+    ) else { return false }
+
+    ctx.draw(cg, in: CGRect(x: 0, y: 0, width: imgW, height: imgH))
+    ctx.setFillColor(CGColor(red: 0.5, green: 0.5, blue: 0.5, alpha: 1))
+    for r in maskRects {
+        // CGWindowBounds is top-down relative to main display origin; CGContext is bottom-up.
+        let relX = (Double(r.origin.x) - Double(dBounds.origin.x)) * scaleX
+        let relTopY = (Double(r.origin.y) - Double(dBounds.origin.y)) * scaleY
+        let rw = Double(r.size.width) * scaleX
+        let rh = Double(r.size.height) * scaleY
+        let cgY = Double(imgH) - relTopY - rh
+        ctx.fill(CGRect(x: relX, y: cgY, width: rw, height: rh))
+    }
+
+    guard let outCG = ctx.makeImage() else { return false }
+    let rep = NSBitmapImageRep(cgImage: outCG)
+    guard let pngData = rep.representation(using: .png, properties: [:]) else { return false }
+    do {
+        try pngData.write(to: URL(fileURLWithPath: dstPath), options: .atomic)
+        return true
+    } catch {
+        return false
+    }
+}
+
 func usage() -> Never {
-    fputs("usage: helper winid <app> | ocr <png> | screens | screen <target> | vdiff <imgA> <imgB> | prep <src> <dst> [max_dim]\n", stderr)
+    fputs("usage: helper winid <app> | ocr <png> | screens | screen <target> | vdiff <imgA> <imgB> | vdiff-cells <imgA> <imgB> | mask <src> <dst> <screen> <title> | prep <src> <dst> [max_dim]\n", stderr)
     exit(2)
 }
 
@@ -212,6 +279,32 @@ case "vdiff":
         }
     }
     print((changed * 100) / total)
+
+case "vdiff-cells":
+    guard args.count >= 4 else { usage() }
+    let gridW = 240
+    let gridH = 150
+    let skipRows = 5 // top ~3.3% (macOS menu bar)
+    guard let cgA = loadCGImage(args[2]),
+          let cgB = loadCGImage(args[3]),
+          let bufA = grayscaleGrid(cgA, width: gridW, height: gridH),
+          let bufB = grayscaleGrid(cgB, width: gridW, height: gridH) else { exit(1) }
+    var changed = 0
+    let startIdx = skipRows * gridW
+    let total = (gridH - skipRows) * gridW
+    for i in startIdx..<(gridW * gridH) {
+        if abs(Int(bufA[i]) - Int(bufB[i])) > 12 {
+            changed += 1
+        }
+    }
+    let pct = (changed * 100) / total
+    print("\(changed)\t\(pct)")
+
+case "mask":
+    guard args.count >= 6 else { usage() }
+    if !maskWindowOnDisplay(srcPath: args[2], dstPath: args[3], screenTarget: args[4], titleSubstr: args[5]) {
+        exit(1)
+    }
 
 case "prep":
     guard args.count >= 4 else { usage() }
