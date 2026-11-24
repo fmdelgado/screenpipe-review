@@ -1,6 +1,6 @@
 # screenpipe-review
 
-Live universal on-screen problem solver for a mirrored window (`MeowDisplay`) or a connected monitor (built-in Mac display or external screen). Every 2s it captures the target window or display, checks for both text (macOS Vision OCR) and visual changes (fast grayscale grid diff), and streams a clean, direct solution using the local Claude Code CLI (subscription auth, no API key).
+Live universal on-screen problem solver for a mirrored window (`MeowDisplay`) or a connected monitor (built-in Mac display or external screen). Every 2s it captures the target window or display, checks for meaningful visual/text changes (ignoring clocks, timers, cursor blink, and OCR jitter), and replaces the terminal view with **only the direct solution to the present question on screen** using the local Claude Code CLI (subscription auth, no API key). Full history is still kept quietly on disk in `output/history.md`.
 
 Works for any kind of challenge on screen — multiple-choice quizzes, math/logic/visual puzzles, coding problems (empty editors or debugging existing code), stack traces/CLI errors, SQL/regex/formulas, diagrams/charts, interview/open-ended questions, forms, and everyday screen tasks.
 

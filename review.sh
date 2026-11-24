@@ -27,6 +27,8 @@ DIR="${SCREENPIPE_DIR:-$(resolve_dir "$0")}"
 OUT="${OUT_DIR:-$DIR/output}"
 STATE="${STATE_DIR:-$DIR/state}"
 LIVE_STREAM="${LIVE_STREAM:-0}"
+CLEAR_ON_START="${CLEAR_ON_START:-0}"
+LIVE_HEADER="${LIVE_HEADER:-}"
 FORCE_REVIEW="${FORCE_REVIEW:-0}"
 mkdir -p "$OUT" "$STATE"
 LOG="$STATE/run.log"
@@ -207,9 +209,6 @@ if ! "$DIR/helper" prep "$STATE/reviewing_src.png" "$REVIEW_IMG" 1920 2>>"$LOG";
   REVIEW_IMG="$STATE/reviewing_src.png"
 fi
 
-PREV=$(tail -c 4000 "$OUT/history.md" 2>/dev/null || true)
-[ -z "$PREV" ] && PREV="(none yet)"
-
 CTX_FILE="$OUT/problem_context.md"
 CTX=$(cat "$CTX_FILE" 2>/dev/null || true)
 [ -z "$CTX" ] && CTX="(none captured yet)"
@@ -225,14 +224,15 @@ fi
 
 cat > "$STATE/sys_prompt.txt" <<EOF
 You are a live on-screen problem solver watching a user's screen.
-For EVERY screenshot you receive, actively identify what needs to be solved, answered, fixed, completed, or decided on screen and immediately provide the concrete solution.
+For EVERY screenshot you receive, actively identify the single present challenge, question, error, or task visible on screen right now and immediately provide its concrete solution.
 
 Never reply with "No new findings", "Nothing to solve", or "There is no challenge on screen". Always look closely at the screenshot — whether it is a quiz, multiple-choice question, math/logic/aptitude puzzle, blank or partial coding challenge, buggy code, stack trace/CLI error, SQL/regex/spreadsheet formula, chart/diagram/visual puzzle, form, interview/open-ended question, reading prompt, message/email needing a reply, or an active workspace — and give the direct, actionable solution or best concrete next action for what is shown.
 
 Ignore OS chrome (menu bar, dock, window frames, file trees) and ignore any "Live Solver" or "Live code review" terminal window itself.
 
-Output ONLY the information relevant to solving the problem on screen:
+Output ONLY the information relevant to solving the PRESENT problem on screen:
 - Lead immediately with the direct answer or solution.
+- NEVER recap, list, or repeat previous questions or earlier solutions — answer ONLY what is currently on screen.
 - NO greetings, NO "Looking at: ...", NO "Here is the solution:", NO "Let me search...", NO filler or meta-commentary.
 - Adapt format to the challenge:
   * Multiple choice / quiz / form: exact answer option(s) first, then 1 brief line explaining why.
@@ -251,11 +251,8 @@ cat > "$STATE/user_prompt.txt" <<EOF
 Watching: $CAPTURE_DESC
 The attached screenshot is the source of truth; on-device OCR below is a supplementary hint.
 
-=== SAVED CONTEXT (from earlier screens) ===
+=== SAVED CONTEXT (background requirements from earlier screens, if relevant to the current screen) ===
 $CTX
-
-=== RECENT SOLUTIONS (for continuity; always still give the complete solution for what is currently on screen) ===
-$PREV
 
 === OCR HINT ===
 $OCR_HINT
@@ -277,6 +274,8 @@ python3 -I "$DIR/solver_stream.py" \
   --context-out "$STATE/context.out" \
   --err-out "$STATE/err.out" \
   --live-stream "$LIVE_STREAM" \
+  --clear-on-start "$CLEAR_ON_START" \
+  --header-text "$LIVE_HEADER" \
   --divider-time "$DIVIDER_TIME" \
   --add-dir "$STATE" \
   --cwd "$DIR"

@@ -553,7 +553,28 @@ assert_contains "$(cat "$T5_DIR/stdin.json" 2>/dev/null)" '"type": "image"' "sol
 assert_contains "$(cat "$T5_DIR/args.txt" 2>/dev/null)" "WebSearch,WebFetch" "solver_stream.py enables WebSearch,WebFetch when --web 1"
 assert_contains "$(cat "$T5_DIR/args.txt" 2>/dev/null)" "--safe-mode" "solver_stream.py passes --safe-mode for fast startup"
 
-# 5b. solver_stream.py handles JSON is_error cleanly without polluting stdout
+# 5b. solver_stream.py --clear-on-start clears terminal+scrollback and prints only header + present solution
+T5C_LIVE=$(STUB_STDIN_CAPTURE="$T5_DIR/stdin_c.json" STUB_ARGS_CAPTURE="$T5_DIR/args_c.txt" \
+  python3 -I "$ROOT/solver_stream.py" \
+    --claude "$STREAM_CLAUDE" \
+    --model claude-sonnet-5-5 \
+    --system-prompt-file "$T5_DIR/sys.txt" \
+    --prompt-file "$T5_DIR/usr.txt" \
+    --web 1 \
+    --status-file "$T5_DIR/status_c" \
+    --reply-out "$T5_DIR/reply_c.txt" \
+    --context-out "$T5_DIR/ctx_c.txt" \
+    --err-out "$T5_DIR/err_c.txt" \
+    --live-stream 1 \
+    --clear-on-start 1 \
+    --header-text "Live Solver · Test" \
+    --divider-time "12:34:56" 2>/dev/null)
+assert_contains "$T5C_LIVE" $'\033[H\033[2J\033[3J' "solver_stream.py --clear-on-start wipes terminal & scrollback before new answer"
+assert_contains "$T5C_LIVE" "Live Solver · Test" "solver_stream.py --clear-on-start prints compact header"
+assert_contains "$T5C_LIVE" "Answer: B (42)" "solver_stream.py --clear-on-start streams present solution"
+assert_not_contains "$T5C_LIVE" "─── 12:34:56 ───" "solver_stream.py --clear-on-start omits redundant timestamp divider"
+
+# 5c. solver_stream.py handles JSON is_error cleanly without polluting stdout
 ERR_JSON_CLAUDE="$TMPBASE/err-json-claude"
 cat > "$ERR_JSON_CLAUDE" <<'EOF'
 #!/bin/bash
@@ -613,6 +634,8 @@ assert_eq "$(cat "$T5R_STATE/did_solve" 2>/dev/null)" "1" "review.sh marks did_s
 assert_contains "$(cat "$TMPBASE/t5r_last_args.txt" 2>/dev/null)" "WebSearch,WebFetch" "review.sh enables WebSearch by default"
 assert_contains "$(cat "$TMPBASE/t5r_last_args.txt" 2>/dev/null)" "Never reply with" "review.sh system prompt forbids bailout replies"
 assert_contains "$(cat "$TMPBASE/t5r_last_args.txt" 2>/dev/null)" "Multiple choice" "review.sh system prompt handles non-coding challenges"
+assert_contains "$(cat "$TMPBASE/t5r_last_args.txt" 2>/dev/null)" "NEVER recap, list, or repeat previous questions" "review.sh system prompt forbids repeating previous questions"
+assert_not_contains "$(cat "$TMPBASE/t5r_last_stdin.json" 2>/dev/null)" "RECENT SOLUTIONS" "review.sh omits long prior-solution history from prompt"
 assert_contains "$(cat "$T5R_OUT/latest.md" 2>/dev/null)" "Answer: 3x^2" "review.sh saves clean solution to latest.md"
 assert_not_contains "$(cat "$T5R_OUT/feed.log" 2>/dev/null)" "Problem context updated" "review.sh keeps feed.log free of context-updated noise"
 assert_contains "$(cat "$T5R_OUT/problem_context.md" 2>/dev/null)" "Calculus quiz active" "review.sh silently saves problem_context.md"
@@ -747,12 +770,7 @@ c=\$((c + 1))
 echo "\$c" > "$T6P_COUNT"
 FLAT_ARGS=\$(printf '%s ' "\$@" | tr '\n' ' ')
 printf 'CALL %s: %s\n' "\$c" "\$FLAT_ARGS" >> "$T6P_ARGS_LOG"
-cat <<'REPLY'
-Solution #\$c: x = 7
-<<<CONTEXT
-- PTY context
-CONTEXT>>>
-REPLY
+printf 'Solution #%s: x = 7\n<<<CONTEXT\n- PTY context\nCONTEXT>>>\n' "\$c"
 EOF
 chmod +x "$T6P_CLAUDE"
 
@@ -776,8 +794,9 @@ proc = subprocess.Popen(
 )
 os.close(slave)
 
+all_out = bytearray()
+
 def drain(timeout=0.1):
-    out = []
     end = time.time() + timeout
     while time.time() < end:
         r, _, _ = select.select([master], [], [], max(0.01, end - time.time()))
@@ -787,10 +806,9 @@ def drain(timeout=0.1):
             chunk = os.read(master, 4096)
             if not chunk:
                 break
-            out.append(chunk)
+            all_out.extend(chunk)
         except OSError:
             break
-    return b"".join(out)
 
 def wait_for(pred, timeout=8.0):
     end = time.time() + timeout
@@ -814,6 +832,12 @@ ok_w_off = wait_for(lambda: read_file(os.path.join(state_dir, "web_enabled")) ==
 # Press Space to force immediate re-solve with web OFF
 os.write(master, b" ")
 ok_force = wait_for(lambda: read_file(count_file) == "2" and read_file(os.path.join(state_dir, "status")) == "watching" and not os.path.exists(os.path.join(state_dir, "lock.d")), timeout=8.0)
+drain(0.2)
+# Check that the visible screen after the last clear contains ONLY Solution #2 (NOT Solution #1)
+CLEAR_SEQ = b"\x1b[H\x1b[2J\x1b[3J"
+parts = bytes(all_out).split(CLEAR_SEQ)
+last_screen = parts[-1].decode("utf-8", errors="replace") if len(parts) > 1 else ""
+only_latest = ("Solution #2" in last_screen) and ("Solution #1" not in last_screen)
 # Press 'w' again to toggle web back ON
 os.write(master, b"w")
 ok_w_on = wait_for(lambda: read_file(os.path.join(state_dir, "web_enabled")) == "1", timeout=3.0)
@@ -829,12 +853,13 @@ except subprocess.TimeoutExpired:
     proc.terminate()
     rc = proc.wait(timeout=2.0)
 os.close(master)
-print(f"ok1={int(ok1)} w_off={int(ok_w_off)} force={int(ok_force)} w_on={int(ok_w_on)} ctx_before={int(ctx_before)} clear={int(ok_clear)} rc={rc}")
+print(f"ok1={int(ok1)} w_off={int(ok_w_off)} force={int(ok_force)} only_latest={int(only_latest)} w_on={int(ok_w_on)} ctx_before={int(ctx_before)} clear={int(ok_clear)} rc={rc}")
 PY
 )
 assert_contains "$PTY_RES" "ok1=1" "PTY live-review completes initial solve and settles idle"
 assert_contains "$PTY_RES" "w_off=1" "pressing [w] toggles web lookup OFF immediately"
 assert_contains "$PTY_RES" "force=1" "pressing [Space] forces immediate solve during long interval"
+assert_contains "$PTY_RES" "only_latest=1" "terminal clears prior answer so ONLY the present solution is visible"
 assert_contains "$PTY_RES" "w_on=1" "pressing [w] again toggles web lookup back ON immediately"
 assert_contains "$PTY_RES" "ctx_before=1 clear=1" "pressing [c] clears saved problem_context.md"
 assert_contains "$PTY_RES" "rc=0" "pressing [q] exits live-review cleanly with code 0"

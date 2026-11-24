@@ -163,15 +163,16 @@ is_paused() {
   [ "$v" = "1" ]
 }
 
+HEADER_TEXT="Live Solver · watching $WATCH_DESC · [w] web  [Space] solve  [p] pause  [c] clear  [q] quit"
 LAST_STATUS=""
 
 print_header() {
   LAST_STATUS=""
   if [ "$INTERACTIVE" = "1" ]; then
     printf '\033]0;Live Solver\007'
-    clear
+    printf '\033[H\033[2J\033[3J'
   fi
-  printf '\033[2mLive Solver · watching %s · [w] web  [Space] solve  [p] pause  [c] clear  [q] quit\033[0m\n' "$WATCH_DESC"
+  printf '\033[2m%s\033[0m\n' "$HEADER_TEXT"
 }
 
 draw_status() {
@@ -334,7 +335,8 @@ while true; do
     draw_status "◌ solving..."
   fi
 
-  LIVE_STREAM=1 FORCE_REVIEW="$RUN_FORCE" \
+  LIVE_STREAM=1 CLEAR_ON_START="$INTERACTIVE" LIVE_HEADER="$HEADER_TEXT" \
+    FORCE_REVIEW="$RUN_FORCE" \
     OUT_DIR="$OUT" STATE_DIR="$STATE" SCREENPIPE_DIR="$DIR" \
     "$DIR/review.sh" &
   REV_PID=$!

@@ -46,10 +46,19 @@ def write_text(path: str, content: str):
 
 
 class StreamEmitter:
-    def __init__(self, live: bool, divider_time: str, streaming_flag: str):
+    def __init__(
+        self,
+        live: bool,
+        divider_time: str,
+        streaming_flag: str,
+        clear_on_start: bool = False,
+        header_text: str = "",
+    ):
         self.live = live
         self.divider_time = divider_time
         self.streaming_flag = streaming_flag
+        self.clear_on_start = clear_on_start
+        self.header_text = header_text
         self.started = False
         self.in_context = False
         self.pending = ""
@@ -64,9 +73,14 @@ class StreamEmitter:
                     f.write("1")
             except OSError:
                 pass
-        sys.stdout.write("\r\033[K")
-        if self.divider_time:
-            sys.stdout.write(f"\n\033[2m─── {self.divider_time} ───\033[0m\n")
+        if self.clear_on_start:
+            sys.stdout.write("\033[H\033[2J\033[3J")
+            if self.header_text:
+                sys.stdout.write(f"\033[2m{self.header_text}\033[0m\n\n")
+        else:
+            sys.stdout.write("\r\033[K")
+            if self.divider_time:
+                sys.stdout.write(f"\n\033[2m─── {self.divider_time} ───\033[0m\n")
         sys.stdout.flush()
 
     def _write(self, chunk: str):
@@ -145,12 +159,15 @@ def main():
     ap.add_argument("--context-out", required=True)
     ap.add_argument("--err-out", required=True)
     ap.add_argument("--live-stream", default="0")
+    ap.add_argument("--clear-on-start", default="0")
+    ap.add_argument("--header-text", default="")
     ap.add_argument("--divider-time", default="")
     ap.add_argument("--add-dir", default="")
     ap.add_argument("--cwd", default="")
     args = ap.parse_args()
 
     live = args.live_stream == "1"
+    clear_on_start = args.clear_on_start == "1"
     web_on = args.web == "1"
 
     with open(args.system_prompt_file, "r", encoding="utf-8") as f:
@@ -201,7 +218,13 @@ def main():
     else:
         cmd += ["--tools", ""]
 
-    emitter = StreamEmitter(live=live, divider_time=args.divider_time, streaming_flag=args.streaming_flag)
+    emitter = StreamEmitter(
+        live=live,
+        divider_time=args.divider_time,
+        streaming_flag=args.streaming_flag,
+        clear_on_start=clear_on_start,
+        header_text=args.header_text,
+    )
     proc = None
 
     def cleanup_flag():
