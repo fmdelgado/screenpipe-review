@@ -1,8 +1,18 @@
 #!/bin/bash
-# Live view of the code reviewer: activity + every reply, in real time.
+# Live view of the background screen solver (clean solution feed only).
+resolve_dir() {
+  local src="$1"
+  while [ -L "$src" ]; do
+    local dir
+    dir=$(cd -P "$(dirname "$src")" && pwd)
+    src=$(readlink "$src")
+    [[ "$src" != /* ]] && src="$dir/$src"
+  done
+  cd -P "$(dirname "$src")" && pwd
+}
+DIR="${SCREENPIPE_DIR:-$(resolve_dir "$0")}"
 P=~/Library/LaunchAgents/com.fernando.screenpipe-review.plist
-launchctl list | grep -q com.fernando.screenpipe-review || launchctl load "$P"
+[ -f "$P" ] && { launchctl list | grep -q com.fernando.screenpipe-review || launchctl load "$P"; }
 clear
-echo "Live code review is watching MeowDisplay. Ctrl+C stops this view; the reviewer keeps running."
-tail -n 30 -F ~/screenpipe-review/output/feed.log ~/screenpipe-review/state/run.log 2>/dev/null |
-  grep --line-buffered -vE '^==> |^$|reviewed: no new findings|could not create image'
+printf '\033[2mLive Solver viewer · Ctrl+C stops this view; background solver keeps running.\033[0m\n'
+tail -n 30 -F "$DIR/output/feed.log" 2>/dev/null

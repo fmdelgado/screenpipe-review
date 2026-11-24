@@ -1,43 +1,385 @@
 #!/bin/bash
-# Start the live code reviewer in the foreground and stream its output.
-# Ctrl+C stops everything.
-DIR="$HOME/screenpipe-review"
-INTERVAL="${INTERVAL:-10}"
-mkdir -p "$DIR/output" "$DIR/state"
-touch "$DIR/output/feed.log" "$DIR/state/run.log"
-rm -rf "$DIR/state/lock.d" "$DIR/state/last_reviewed.txt"   # review right away on start
+# Start the live on-screen problem solver in the foreground with a clean,
+# solution-only view and instant single-key controls. Ctrl+C or q stops everything.
+set -u
 
-if ! "$DIR/helper" winid "${WINDOW_MATCH:-MeowDisplay}" >/dev/null; then
-  echo "⚠️  MeowDisplay window not found — open it; reviewing starts automatically once it appears."
+resolve_dir() {
+  local src="$1"
+  while [ -L "$src" ]; do
+    local dir
+    dir=$(cd -P "$(dirname "$src")" && pwd)
+    src=$(readlink "$src")
+    [[ "$src" != /* ]] && src="$dir/$src"
+  done
+  cd -P "$(dirname "$src")" && pwd
+}
+
+DIR="${SCREENPIPE_DIR:-$(resolve_dir "$0")}"
+OUT="${OUT_DIR:-$DIR/output}"
+STATE="${STATE_DIR:-$DIR/state}"
+INTERVAL="${INTERVAL:-2}"
+WEB_INIT="${WEB_SEARCH:-1}"
+
+usage() {
+  cat <<'EOF'
+Usage: live-review [options]
+
+Options:
+  -s, --screen <target>   Capture a monitor instead of an app window.
+                          <target>: 1, 2, external, builtin, main, secondary, or monitor name
+  -w, --window <app>      Capture an app window (default: MeowDisplay)
+  -l, --list-screens      List connected displays and exit
+  -i, --interval <sec>    Poll interval in seconds (default: 2)
+  -m, --model <model>     Claude model name/alias (default: claude-sonnet-5-5)
+      --web               Enable on-demand web lookup (default)
+      --no-web            Start with web lookup OFF (fastest direct solve)
+  -h, --help              Show this help and exit
+
+Live controls (press anytime while running):
+  [w]      Toggle web lookup ON / OFF on the fly
+  [Space]  Force an immediate solve right now (Enter also works)
+  [p]      Pause / resume automatic watching
+  [c]      Clear screen and reset saved context/history
+  [q]      Quit (or Ctrl+C)
+
+Environment:
+  SCREEN_TARGET, WINDOW_MATCH, INTERVAL, REVIEW_MODEL, WEB_SEARCH
+EOF
+}
+
+ensure_helper() {
+  if [ ! -x "$DIR/helper" ] || [ "$DIR/helper.swift" -nt "$DIR/helper" ]; then
+    swiftc -O "$DIR/helper.swift" -o "$DIR/helper" || exit 1
+  fi
+}
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -s|--screen)
+      [ $# -ge 2 ] || { echo "error: $1 requires a screen target" >&2; usage >&2; exit 2; }
+      export SCREEN_TARGET="$2"
+      shift 2
+      ;;
+    --screen=*)
+      export SCREEN_TARGET="${1#*=}"
+      [ -n "$SCREEN_TARGET" ] || { echo "error: --screen requires a target" >&2; exit 2; }
+      shift
+      ;;
+    -w|--window)
+      [ $# -ge 2 ] || { echo "error: $1 requires an app name" >&2; usage >&2; exit 2; }
+      export WINDOW_MATCH="$2"
+      unset SCREEN_TARGET
+      shift 2
+      ;;
+    --window=*)
+      export WINDOW_MATCH="${1#*=}"
+      [ -n "$WINDOW_MATCH" ] || { echo "error: --window requires an app name" >&2; exit 2; }
+      unset SCREEN_TARGET
+      shift
+      ;;
+    -i|--interval)
+      [ $# -ge 2 ] || { echo "error: $1 requires seconds" >&2; usage >&2; exit 2; }
+      INTERVAL="$2"
+      shift 2
+      ;;
+    --interval=*)
+      INTERVAL="${1#*=}"
+      shift
+      ;;
+    -m|--model)
+      [ $# -ge 2 ] || { echo "error: $1 requires a model" >&2; usage >&2; exit 2; }
+      export REVIEW_MODEL="$2"
+      shift 2
+      ;;
+    --model=*)
+      export REVIEW_MODEL="${1#*=}"
+      shift
+      ;;
+    --web)
+      WEB_INIT="1"
+      shift
+      ;;
+    --no-web)
+      WEB_INIT="0"
+      shift
+      ;;
+    -l|--list-screens)
+      ensure_helper
+      exec "$DIR/helper" screens
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "error: unknown option '$1'" >&2
+      usage >&2
+      exit 2
+      ;;
+  esac
+done
+
+ensure_helper
+mkdir -p "$OUT" "$STATE"
+touch "$OUT/feed.log" "$STATE/run.log"
+rm -rf "$STATE/lock.d" "$STATE/last_reviewed.txt" "$STATE/last_reviewed.png" "$STATE/streaming"
+
+[ "$WEB_INIT" = "0" ] || WEB_INIT="1"
+echo "$WEB_INIT" > "$STATE/web_enabled"
+echo "0" > "$STATE/paused"
+
+INTERACTIVE=0
+SAVED_STTY=""
+if [ -t 0 ] && [ -t 1 ] && [ "${TERM:-dumb}" != "dumb" ]; then
+  INTERACTIVE=1
+  SAVED_STTY=$(stty -g 2>/dev/null || true)
+  stty -echo 2>/dev/null || true
 fi
 
-clear
-printf '\033[1mLive code review\033[0m — model %s, every %ss · Ctrl+C to stop\n' \
-  "${REVIEW_MODEL:-claude-sonnet-5-5}" "$INTERVAL"
-printf 'Problem context: %s\n\n' "$DIR/output/problem_context.md"
+if [ -n "${SCREEN_TARGET:-}" ]; then
+  if SCREEN_INFO=$("$DIR/helper" screen "$SCREEN_TARGET" 2>/dev/null); then
+    DIDX="${SCREEN_INFO%%$'\t'*}"
+    DNAME="${SCREEN_INFO#*$'\t'}"
+    WATCH_DESC="screen $DIDX ($DNAME)"
+  else
+    WATCH_DESC="screen $SCREEN_TARGET"
+  fi
+elif [ -n "${CAPTURE_IMAGE:-}" ]; then
+  WATCH_DESC="image $(basename "$CAPTURE_IMAGE")"
+else
+  TARGET_WIN="${WINDOW_MATCH:-MeowDisplay}"
+  WATCH_DESC="window $TARGET_WIN"
+fi
 
-# stream replies + status lines (status in grey)
-tail -q -n 0 -F "$DIR/output/feed.log" "$DIR/state/run.log" 2>/dev/null |
-  while IFS= read -r line; do
-    case "$line" in
-      20[0-9][0-9]-*) printf '\r\033[K\033[2m%s\033[0m\n' "$line" ;;
-      *) printf '\r\033[K%s\n' "$line" ;;
-    esac
-  done &
-TAIL=$!
+web_label() {
+  local v
+  v=$(tr -d '[:space:]' < "$STATE/web_enabled" 2>/dev/null || echo "1")
+  if [ "$v" = "0" ]; then echo "OFF"; else echo "ON"; fi
+}
+
+is_paused() {
+  local v
+  v=$(tr -d '[:space:]' < "$STATE/paused" 2>/dev/null || echo "0")
+  [ "$v" = "1" ]
+}
+
+print_header() {
+  [ "$INTERACTIVE" = "1" ] && clear
+  printf '\033[2mLive Solver · watching %s · [w] web  [Space] solve  [p] pause  [c] clear  [q] quit\033[0m\n' "$WATCH_DESC"
+}
+
+draw_status() {
+  local label="$1"
+  local wl
+  wl=$(web_label)
+  if [ "$INTERACTIVE" = "1" ]; then
+    printf '\r\033[K\033[2m%s · web %s\033[0m' "$label" "$wl"
+  fi
+}
+
+REV_PID=""
+FORCE_NEXT=1
+QUEUED_FORCE=0
+QUEUED_CLEAR=0
+CLEANING_UP=0
 
 cleanup() {
-  trap - INT TERM; exec 2>/dev/null
-  pkill -P $$ 2>/dev/null                      # sleep / review.sh / tail pipeline
-  pkill -f "tail -q -n 0 -F $DIR" 2>/dev/null
-  rm -rf "$DIR/state/lock.d"
-  echo; echo "stopped."; exit 0
+  [ "$CLEANING_UP" = "1" ] && exit 0
+  CLEANING_UP=1
+  trap - INT TERM EXIT
+  if [ -n "$REV_PID" ]; then
+    pkill -P "$REV_PID" 2>/dev/null || true
+    kill "$REV_PID" 2>/dev/null || true
+  fi
+  pkill -P $$ 2>/dev/null || true
+  rm -rf "$STATE/lock.d" "$STATE/streaming"
+  if [ -n "$SAVED_STTY" ]; then
+    stty "$SAVED_STTY" 2>/dev/null || true
+  fi
+  if [ "$INTERACTIVE" = "1" ]; then
+    printf '\r\033[K\n'
+  fi
+  exit 0
 }
-trap cleanup INT TERM
+trap cleanup INT TERM EXIT
 
-# run children in background + wait, so Ctrl+C is handled immediately
+toggle_web() {
+  local cur
+  cur=$(tr -d '[:space:]' < "$STATE/web_enabled" 2>/dev/null || echo "1")
+  if [ "$cur" = "0" ]; then
+    echo "1" > "$STATE/web_enabled"
+  else
+    echo "0" > "$STATE/web_enabled"
+  fi
+}
+
+toggle_pause() {
+  if is_paused; then
+    echo "0" > "$STATE/paused"
+  else
+    echo "1" > "$STATE/paused"
+  fi
+}
+
+clear_session() {
+  rm -f "$OUT/problem_context.md" "$OUT/history.md" "$STATE/last_reviewed.txt" "$STATE/last_reviewed.png"
+  print_header
+  if is_paused; then
+    draw_status "⏸ paused"
+  else
+    draw_status "● watching (cleared)"
+  fi
+}
+
+# Handle a keypress. Returns 0 normally, 10 to immediately break out of idle wait and solve.
+handle_key() {
+  local key="$1"
+  local mode="$2"  # "idle" or "running"
+  case "$key" in
+    w|W)
+      toggle_web
+      if [ "$mode" = "idle" ]; then
+        if is_paused; then
+          draw_status "⏸ paused"
+        else
+          draw_status "● watching"
+        fi
+      elif [ ! -f "$STATE/streaming" ]; then
+        local st
+        st=$(cat "$STATE/status" 2>/dev/null || echo "solving...")
+        draw_status "◌ $st"
+      fi
+      ;;
+    p|P)
+      toggle_pause
+      if [ "$mode" = "idle" ]; then
+        if is_paused; then
+          draw_status "⏸ paused"
+        else
+          draw_status "● watching"
+        fi
+      fi
+      ;;
+    " "|""|$'\r'|$'\n')
+      if [ "$mode" = "idle" ]; then
+        FORCE_NEXT=1
+        return 10
+      else
+        QUEUED_FORCE=1
+      fi
+      ;;
+    c|C)
+      if [ "$mode" = "idle" ]; then
+        clear_session
+      else
+        QUEUED_CLEAR=1
+      fi
+      ;;
+    q|Q)
+      cleanup
+      ;;
+  esac
+  return 0
+}
+
+wait_interval() {
+  local secs="$1"
+  if [ "$INTERACTIVE" != "1" ]; then
+    sleep "$secs" & wait $!
+    return 0
+  fi
+  local whole="${secs%.*}"
+  [ -z "$whole" ] || [ "$whole" -lt 1 ] 2>/dev/null && whole=1
+  local i=0
+  local key=""
+  while [ "$i" -lt "$whole" ]; do
+    if IFS= read -rsn1 -t 1 key; then
+      handle_key "$key" "idle"
+      [ $? -eq 10 ] && return 0
+      # Keep waiting if paused; if unpaused on non-force key, refresh timer smoothly
+      if ! is_paused; then
+        i=$((i + 1))
+      fi
+    else
+      if ! is_paused; then
+        i=$((i + 1))
+      fi
+    fi
+  done
+  return 0
+}
+
+print_header
+
 while true; do
-  "$DIR/review.sh" & wait $!
-  printf '\r\033[K\033[2m⏱ %s checked · %s\033[0m' "$(date +%H:%M:%S)" "$(cat "$DIR/state/status" 2>/dev/null)"
-  sleep "$INTERVAL" & wait $!
+  if is_paused && [ "$FORCE_NEXT" != "1" ]; then
+    draw_status "⏸ paused"
+    wait_interval 1
+    continue
+  fi
+
+  RUN_FORCE="$FORCE_NEXT"
+  FORCE_NEXT=0
+  QUEUED_FORCE=0
+
+  if [ "$RUN_FORCE" = "1" ]; then
+    draw_status "◌ solving..."
+  fi
+
+  LIVE_STREAM=1 FORCE_REVIEW="$RUN_FORCE" \
+    OUT_DIR="$OUT" STATE_DIR="$STATE" SCREENPIPE_DIR="$DIR" \
+    "$DIR/review.sh" &
+  REV_PID=$!
+
+  if [ "$INTERACTIVE" = "1" ]; then
+    # Brief wait so fast unchanged skips finish immediately without 1s read latency
+    sleep 0.25 2>/dev/null || true
+    while kill -0 "$REV_PID" 2>/dev/null; do
+      if [ ! -f "$STATE/streaming" ]; then
+        CUR_ST=$(cat "$STATE/status" 2>/dev/null || echo "")
+        case "$CUR_ST" in
+          "solving..."|"searching web...") draw_status "◌ $CUR_ST" ;;
+        esac
+      fi
+      key=""
+      if IFS= read -rsn1 -t 1 key; then
+        handle_key "$key" "running"
+      fi
+    done
+  fi
+
+  wait "$REV_PID" 2>/dev/null || true
+  REV_PID=""
+
+  if [ "$QUEUED_CLEAR" = "1" ]; then
+    QUEUED_CLEAR=0
+    clear_session
+    wait_interval "$INTERVAL"
+    continue
+  fi
+
+  DID_SOLVE=$(cat "$STATE/did_solve" 2>/dev/null || echo "0")
+  CUR_ST=$(cat "$STATE/status" 2>/dev/null || echo "watching")
+
+  if is_paused; then
+    draw_status "⏸ paused"
+  else
+    case "$CUR_ST" in
+      "retrying..."|"screenshot failed") draw_status "⚠ $CUR_ST" ;;
+      *"not found"*) draw_status "◌ $CUR_ST" ;;
+      *) draw_status "● watching" ;;
+    esac
+  fi
+
+  if [ "$QUEUED_FORCE" = "1" ]; then
+    FORCE_NEXT=1
+    continue
+  fi
+
+  # Immediately re-check once after solving to catch screen changes made mid-answer
+  if [ "$DID_SOLVE" = "1" ] && ! is_paused; then
+    continue
+  fi
+
+  wait_interval "$INTERVAL"
 done
