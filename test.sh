@@ -647,15 +647,17 @@ STATE_DIR="$T5R_STATE" OUT_DIR="$T5R_OUT" CAPTURE_IMAGE="$TMPBASE/page_base.png"
 assert_eq "$(cat "$T5R_COUNT")" "1" "review.sh skips unchanged screenshot"
 assert_eq "$(cat "$T5R_STATE/did_solve" 2>/dev/null)" "0" "review.sh marks did_solve=0 when skipped"
 
-# Run 3: small 1-line question added to 25-line static page (sim ~96% > old 90%!) -> MUST trigger!
+# Run 3: when awaiting_more=1 (waiting for scroll), even a small 1-line addition triggers immediately!
 echo "0" > "$T5R_STATE/web_enabled"
+echo "1" > "$T5R_STATE/awaiting_more"
 STATE_DIR="$T5R_STATE" OUT_DIR="$T5R_OUT" CAPTURE_IMAGE="$TMPBASE/page_small_add.png" \
   CLAUDE_BIN="$T5R_CLAUDE" NO_NOTIFY=1 "$ROOT/review.sh"
-assert_eq "$(cat "$T5R_COUNT")" "2" "review.sh triggers on single new question line on a large static page"
+assert_eq "$(cat "$T5R_COUNT")" "2" "review.sh triggers on single new line when awaiting_more=1"
 assert_not_contains "$(cat "$TMPBASE/t5r_last_args.txt" 2>/dev/null)" "WebSearch" "review.sh immediately disables WebSearch when state/web_enabled=0"
 
-# Run 4: visual-only change (identical OCR text, black diagram box added) -> MUST trigger via vdiff!
+# Run 4: visual-only change (identical OCR text, large black diagram box added >=12%) -> MUST trigger via vdiff!
 echo "1" > "$T5R_STATE/web_enabled"
+echo "1" > "$T5R_STATE/awaiting_more"
 STATE_DIR="$T5R_STATE" OUT_DIR="$T5R_OUT" CAPTURE_IMAGE="$TMPBASE/page_base.png" \
   CLAUDE_BIN="$T5R_CLAUDE" NO_NOTIFY=1 "$ROOT/review.sh"
 STATE_DIR="$T5R_STATE" OUT_DIR="$T5R_OUT" CAPTURE_IMAGE="$TMPBASE/page_visual_change.png" \
@@ -910,11 +912,11 @@ func renderPNG(path: String, lines: [String], cursor: Bool = false) {
 
 let base = CommandLine.arguments[1]
 let staticLines = (1...20).map { "Static quiz context line number \($0) on screen" }
-renderPNG(path: "\(base)/t7_base.png", lines: staticLines + ["Time remaining: 14:59"])
-renderPNG(path: "\(base)/t7_cursor.png", lines: staticLines + ["Time remaining: 14:59"], cursor: true)
-renderPNG(path: "\(base)/t7_timer_tick.png", lines: staticLines + ["Time remaining: 14:58"])
-renderPNG(path: "\(base)/t7_self_echo.png", lines: staticLines + ["Time remaining: 14:58", "Live Solver · watching screen 1", "Answer: Option C is correct"])
-renderPNG(path: "\(base)/t7_real_change.png", lines: staticLines + ["Time remaining: 14:57", "Question 2: Solve 3x + 5 = 20"])
+renderPNG(path: "\(base)/t7_base.png", lines: staticLines + ["Question 1: Compute the derivative of sin(x) plus cos(x) today", "Time remaining: 14:59"])
+renderPNG(path: "\(base)/t7_cursor.png", lines: staticLines + ["Question 1: Compute the derivative of sin(x) plus cos(x) today", "Time remaining: 14:59"], cursor: true)
+renderPNG(path: "\(base)/t7_timer_tick.png", lines: staticLines + ["Question 1: Compute the derivative of sin(x) plus cos(x) today", "Time remaining: 14:58"])
+renderPNG(path: "\(base)/t7_self_echo.png", lines: staticLines + ["Question 1: Compute the derivative of sin(x) plus cos(x) today", "Time remaining: 14:58", "Live Solver · watching screen 1", "Answer: Option C is correct"])
+renderPNG(path: "\(base)/t7_real_change.png", lines: staticLines + ["Question 2: Solve the linear equation 3x + 5 = 20 for x now", "Time remaining: 14:57"])
 SWIFT
 
 # 7a. helper vdiff-cells distinguishes zero/cursor noise from real changes
@@ -1170,6 +1172,127 @@ assert_eq "$T8C_IMGS3" "1" "switching to unrelated problem auto-resets page buff
 STATE_DIR="$T8C_STATE" OUT_DIR="$T8C_OUT" CAPTURE_IMAGE="$TMPBASE/unrelated_quiz.png" \
   FORCE_REVIEW=1 SCROLL_SETTLE=0 CLAUDE_BIN="$T8C_CLAUDE" NO_NOTIFY=1 "$ROOT/review.sh"
 assert_contains "$(cat "$TMPBASE/t8c_args_4.txt" 2>/dev/null)" "Do NOT ask to scroll down" "FORCE_REVIEW=1 instructs Claude to solve immediately without asking to scroll"
+
+echo
+echo "=== Task 9: Smart Typing Shield (do not wipe answer while user types) ==="
+
+swift - "$TMPBASE" <<'SWIFT'
+import Foundation
+import AppKit
+
+func renderForm(path: String, questionLines: [String], answerLines: [String]) {
+    let w = 1100, h = 800
+    let rep = NSBitmapImageRep(
+        bitmapDataPlanes: nil, pixelsWide: w, pixelsHigh: h,
+        bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
+        colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0
+    )!
+    NSGraphicsContext.saveGraphicsState()
+    NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: rep)
+    NSColor.white.setFill()
+    NSRect(x: 0, y: 0, width: w, height: h).fill()
+    let qAttrs: [NSAttributedString.Key: Any] = [
+        .font: NSFont.monospacedSystemFont(ofSize: 18, weight: .regular),
+        .foregroundColor: NSColor.black
+    ]
+    let aAttrs: [NSAttributedString.Key: Any] = [
+        .font: NSFont.monospacedSystemFont(ofSize: 17, weight: .regular),
+        .foregroundColor: NSColor(calibratedWhite: 0.15, alpha: 1)
+    ]
+    var y = h - 50
+    for line in questionLines {
+        NSString(string: line).draw(at: NSPoint(x: 35, y: CGFloat(y)), withAttributes: qAttrs)
+        y -= 26
+    }
+    y -= 20
+    NSColor(calibratedWhite: 0.85, alpha: 1).setStroke()
+    NSBezierPath(rect: NSRect(x: 35, y: 120, width: 1030, height: CGFloat(y - 120))).stroke()
+    var ay = y - 30
+    for line in answerLines {
+        NSString(string: line).draw(at: NSPoint(x: 50, y: CGFloat(ay)), withAttributes: aAttrs)
+        ay -= 25
+    }
+    NSGraphicsContext.restoreGraphicsState()
+    try! rep.representation(using: .png, properties: [:])!.write(to: URL(fileURLWithPath: path))
+}
+
+let b = CommandLine.arguments[1]
+let chrome = [
+    "Assessment Portal — Data Quality & Quantitative Reasoning",
+    "Progress: Section 2 of 4 | All work auto-saved",
+    "------------------------------------------------------------"
+]
+let q1 = chrome + [
+    "Question 1: In the 2025 veterinary dataset, R3 duplicates R2,",
+    "R5 has a missing amount, and R6 is negative (-2 kg).",
+    "Explain how you handle each row and write a short narrative."
+]
+let q2 = chrome + [
+    "Question 2: Compute the Bayes posterior probability that a",
+    "patient has the condition given sensitivity 90%, specificity",
+    "95%, and baseline prevalence 2% in the target population."
+]
+
+renderForm(path: "\(b)/t9_q1_empty.png", questionLines: q1, answerLines: ["Type your answer here..."])
+renderForm(path: "\(b)/t9_q1_typing1.png", questionLines: q1, answerLines: [
+    "I removed R3 because the manifest confirms it duplicates R2."
+])
+renderForm(path: "\(b)/t9_q1_typing_long.png", questionLines: q1, answerLines: [
+    "I removed R3 because the manifest confirms it duplicates R2.",
+    "I kept R5 as NULL and quarantined R6 rather than imputing",
+    "zero or flipping the sign, and excluded both from headline",
+    "totals pending provider clarification and reconciliation."
+])
+renderForm(path: "\(b)/t9_q1_rewriting.png", questionLines: q1, answerLines: [
+    "Drop R3 (confirmed duplicate of R2). Quarantine R6 (-2 kg)",
+    "and leave R5 missing without imputation; flag both in log."
+])
+renderForm(path: "\(b)/t9_q2_next.png", questionLines: q2, answerLines: ["Type your answer here..."])
+SWIFT
+
+T9_STATE="$TMPBASE/t9_state"
+T9_OUT="$TMPBASE/t9_out"
+T9_CALLS="$TMPBASE/t9_calls"
+echo 0 > "$T9_CALLS"
+T9_CLAUDE="$TMPBASE/t9-claude"
+cat > "$T9_CLAUDE" <<EOF
+#!/bin/bash
+cat >/dev/null
+c=\$(cat "$T9_CALLS")
+echo \$((c + 1)) > "$T9_CALLS"
+echo "Solution for call \$((c + 1))."
+EOF
+chmod +x "$T9_CLAUDE"
+
+# 1. Solve Q1 initially
+STATE_DIR="$T9_STATE" OUT_DIR="$T9_OUT" CAPTURE_IMAGE="$TMPBASE/t9_q1_empty.png" \
+  SCROLL_SETTLE=0 CLAUDE_BIN="$T9_CLAUDE" NO_NOTIFY=1 "$ROOT/review.sh"
+assert_eq "$(cat "$T9_CALLS")" "1" "Smart Typing Shield: solves Q1 initially"
+
+# 2. User starts typing (replaces placeholder with 1 sentence) -> MUST NOT re-trigger!
+STATE_DIR="$T9_STATE" OUT_DIR="$T9_OUT" CAPTURE_IMAGE="$TMPBASE/t9_q1_typing1.png" \
+  SCROLL_SETTLE=0 CLAUDE_BIN="$T9_CLAUDE" NO_NOTIFY=1 "$ROOT/review.sh"
+assert_eq "$(cat "$T9_CALLS")" "1" "Smart Typing Shield: typing first sentence does NOT wipe solution"
+
+# 3. User types full 4-line (~40-word) paragraph -> MUST NOT re-trigger!
+STATE_DIR="$T9_STATE" OUT_DIR="$T9_OUT" CAPTURE_IMAGE="$TMPBASE/t9_q1_typing_long.png" \
+  SCROLL_SETTLE=0 CLAUDE_BIN="$T9_CLAUDE" NO_NOTIFY=1 "$ROOT/review.sh"
+assert_eq "$(cat "$T9_CALLS")" "1" "Smart Typing Shield: typing 40-word paragraph does NOT wipe solution"
+
+# 4. User deletes & rewrites their typed answer -> MUST NOT re-trigger!
+STATE_DIR="$T9_STATE" OUT_DIR="$T9_OUT" CAPTURE_IMAGE="$TMPBASE/t9_q1_rewriting.png" \
+  SCROLL_SETTLE=0 CLAUDE_BIN="$T9_CLAUDE" NO_NOTIFY=1 "$ROOT/review.sh"
+assert_eq "$(cat "$T9_CALLS")" "1" "Smart Typing Shield: backspacing and rewriting answer does NOT wipe solution"
+
+# 5. User presses Space (FORCE_REVIEW=1) to review typed answer -> MUST trigger immediately!
+STATE_DIR="$T9_STATE" OUT_DIR="$T9_OUT" CAPTURE_IMAGE="$TMPBASE/t9_q1_rewriting.png" \
+  FORCE_REVIEW=1 SCROLL_SETTLE=0 CLAUDE_BIN="$T9_CLAUDE" NO_NOTIFY=1 "$ROOT/review.sh"
+assert_eq "$(cat "$T9_CALLS")" "2" "Smart Typing Shield: Space (FORCE_REVIEW=1) reviews typed answer on demand"
+
+# 6. User advances to Question 2 (replaces Q1 text inside same page frame) -> MUST auto-trigger immediately!
+STATE_DIR="$T9_STATE" OUT_DIR="$T9_OUT" CAPTURE_IMAGE="$TMPBASE/t9_q2_next.png" \
+  SCROLL_SETTLE=0 CLAUDE_BIN="$T9_CLAUDE" NO_NOTIFY=1 "$ROOT/review.sh"
+assert_eq "$(cat "$T9_CALLS")" "3" "Smart Typing Shield: advancing to Next Question auto-triggers immediately"
 
 echo
 echo "Summary: $PASS passed, $FAIL failed"

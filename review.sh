@@ -96,7 +96,10 @@ if ! capture_once "$SHOT"; then
   exit 0
 fi
 
-# Fast Pixel-First + Jitter-Resistant Dual Change Detection
+AWAITING_MORE="0"
+[ -f "$STATE/awaiting_more" ] && AWAITING_MORE=$(tr -d '[:space:]' < "$STATE/awaiting_more")
+
+# Fast Pixel-First + Jitter-Resistant Dual Change Detection (with Smart Typing Shield)
 CHANGE_REASON=""
 TEXT=""
 if [ "$FORCE_REVIEW" = "1" ]; then
@@ -107,15 +110,20 @@ else
   VINFO=$("$DIR/helper" vdiff-cells "$STATE/last_reviewed.png" "$SHOT" 2>/dev/null || echo "99999	100")
   VCELLS="${VINFO%%$'\t'*}"
   VPCT="${VINFO#*$'\t'}"
+  # Sensitive threshold while waiting for scroll (awaiting_more=1);
+  # Smart Typing Shield once a complete solution is already on screen (awaiting_more=0).
+  VDIFF_THRESH=12
+  [ "$AWAITING_MORE" = "1" ] && VDIFF_THRESH=2
+
   if [ "${VCELLS:-0}" -eq 0 ] 2>/dev/null; then
     # Zero visual pixels changed below menu bar -> skip Vision OCR & Claude completely
     status "watching"
     exit 0
-  elif [ "${VPCT:-0}" -ge 2 ] 2>/dev/null; then
+  elif [ "${VPCT:-0}" -ge "$VDIFF_THRESH" ] 2>/dev/null; then
     CHANGE_REASON="visual changed (${VPCT}%)"
   else
-    # Small localized visual change (e.g. new line, small edit, or countdown timer):
-    # verify via OCR whether meaningful non-volatile text actually changed.
+    # Localized visual change: verify via OCR whether the problem itself changed
+    # (vs typing an answer into the current question, timer ticks, or OCR jitter).
     TEXT=$("$DIR/helper" ocr "$SHOT" 2>/dev/null || true)
     printf '%s' "$TEXT" > "$STATE/current.txt"
     TEXT_CHANGE=$(python3 -I -c '
@@ -157,6 +165,8 @@ def to_tokens(lines):
 lines_a = load_clean_lines(sys.argv[1])
 lines_b = load_clean_lines(sys.argv[2])
 own_lines = set(load_clean_lines(sys.argv[3])) if len(sys.argv) > 3 else set()
+awaiting_more = (sys.argv[4] == "1") if len(sys.argv) > 4 else False
+vpct = int(sys.argv[5]) if len(sys.argv) > 5 and sys.argv[5].isdigit() else 0
 
 # Remove lines belonging to our own last rendered solution (self-capture fallback guard)
 lines_a = [l for l in lines_a if l not in own_lines]
@@ -174,22 +184,36 @@ add_chars = sum(len(w) * n for w, n in added.items())
 rem_chars = sum(len(w) * n for w, n in removed.items())
 digit_changed = any(any(ch.isdigit() for ch in w) for w in (set(added) | set(removed)))
 
+total_a = sum(wa.values())
 union_cnt = sum((wa | wb).values())
 inter_cnt = sum((wa & wb).values())
 sim = int(100 * inter_cnt / max(1, union_cnt)) if union_cnt else 100
+retained = int(100 * inter_cnt / max(1, total_a)) if total_a else 100
 
-changed = (
-    (delta_words >= 3)
-    or (add_chars >= 10)
-    or (rem_chars >= 10)
-    or (digit_changed and delta_words >= 2)
-    or (sim < 95 and delta_words >= 2)
-)
-print(f"{1 if changed else 0} {sim} {add_cnt} {rem_cnt}")
-' "$STATE/last_reviewed.txt" "$STATE/current.txt" "$OUT/latest.md")
-    read -r TXT_CHANGED SIM ADDED_CNT REMOVED_CNT <<< "$TEXT_CHANGE"
+if awaiting_more:
+    # Sensitive mode while collecting remaining scrolls of an incomplete problem
+    changed = (
+        (delta_words >= 3)
+        or (add_chars >= 10)
+        or (rem_chars >= 10)
+        or (digit_changed and delta_words >= 2)
+        or (sim < 95 and delta_words >= 2)
+    )
+else:
+    # Smart Typing Shield: once a complete solution is shown, typing into the current
+    # question retains almost all existing words (retained >= 80%, rem_cnt < 8).
+    # Auto-trigger only when the question/screen actually shifts or gets replaced.
+    changed = (
+        (total_a >= 6 and retained < 80)
+        or (rem_cnt >= 8 and add_cnt >= 8)
+        or (total_a < 6 and add_cnt >= 6)
+        or (total_a < 10 and vpct >= 4)
+    )
+print(f"{1 if changed else 0} {sim} {retained} {add_cnt} {rem_cnt}")
+' "$STATE/last_reviewed.txt" "$STATE/current.txt" "$OUT/latest.md" "$AWAITING_MORE" "$VPCT")
+    read -r TXT_CHANGED SIM RETAINED ADDED_CNT REMOVED_CNT <<< "$TEXT_CHANGE"
     if [ "$TXT_CHANGED" = "1" ]; then
-      CHANGE_REASON="text changed (sim ${SIM}%, +${ADDED_CNT}/-${REMOVED_CNT} words)"
+      CHANGE_REASON="text changed (sim ${SIM}%, retained ${RETAINED}%, +${ADDED_CNT}/-${REMOVED_CNT} words)"
     fi
   fi
 fi
@@ -208,8 +232,6 @@ fi
 # === Rolling Multi-Scroll Page Buffer ($STATE/pages/) ===
 PAGES_DIR="$STATE/pages"
 mkdir -p "$PAGES_DIR"
-AWAITING_MORE="0"
-[ -f "$STATE/awaiting_more" ] && AWAITING_MORE=$(tr -d '[:space:]' < "$STATE/awaiting_more")
 
 # Auto-reset rolling page buffer when switching to an unrelated problem (unless awaiting_more=1)
 if [ "$AWAITING_MORE" != "1" ] && [ "$FORCE_REVIEW" != "1" ] && [ -f "$PAGES_DIR/last_page.txt" ]; then
