@@ -2,6 +2,7 @@
 set -u
 
 ROOT=$(cd -P "$(dirname "$0")" && pwd)
+export SCROLL_SETTLE=0
 TMPBASE="${TMPDIR:-/tmp}/screenpipe-review-tests-$$"
 mkdir -p "$TMPBASE"
 trap 'rm -rf "$TMPBASE"' EXIT
@@ -634,7 +635,7 @@ assert_eq "$(cat "$T5R_STATE/did_solve" 2>/dev/null)" "1" "review.sh marks did_s
 assert_contains "$(cat "$TMPBASE/t5r_last_args.txt" 2>/dev/null)" "WebSearch,WebFetch" "review.sh enables WebSearch by default"
 assert_contains "$(cat "$TMPBASE/t5r_last_args.txt" 2>/dev/null)" "Never reply with" "review.sh system prompt forbids bailout replies"
 assert_contains "$(cat "$TMPBASE/t5r_last_args.txt" 2>/dev/null)" "Multiple choice" "review.sh system prompt handles non-coding challenges"
-assert_contains "$(cat "$TMPBASE/t5r_last_args.txt" 2>/dev/null)" "NEVER recap, list, or repeat previous questions" "review.sh system prompt forbids repeating previous questions"
+assert_contains "$(cat "$TMPBASE/t5r_last_args.txt" 2>/dev/null)" "NEVER recap, list, or repeat previous" "review.sh system prompt forbids repeating previous questions"
 assert_not_contains "$(cat "$TMPBASE/t5r_last_stdin.json" 2>/dev/null)" "RECENT SOLUTIONS" "review.sh omits long prior-solution history from prompt"
 assert_contains "$(cat "$T5R_OUT/latest.md" 2>/dev/null)" "Answer: 3x^2" "review.sh saves clean solution to latest.md"
 assert_not_contains "$(cat "$T5R_OUT/feed.log" 2>/dev/null)" "Problem context updated" "review.sh keeps feed.log free of context-updated noise"
@@ -841,10 +842,11 @@ only_latest = ("Solution #2" in last_screen) and ("Solution #1" not in last_scre
 # Press 'w' again to toggle web back ON
 os.write(master, b"w")
 ok_w_on = wait_for(lambda: read_file(os.path.join(state_dir, "web_enabled")) == "1", timeout=3.0)
-# Press 'c' to clear saved context
+# Press 'c' to clear saved context and rolling page buffer
 ctx_before = os.path.exists(os.path.join(out_dir, "problem_context.md"))
+pages_before = os.path.isdir(os.path.join(state_dir, "pages"))
 os.write(master, b"c")
-ok_clear = wait_for(lambda: not os.path.exists(os.path.join(out_dir, "problem_context.md")), timeout=3.0)
+ok_clear = wait_for(lambda: (not os.path.exists(os.path.join(out_dir, "problem_context.md"))) and (not os.path.exists(os.path.join(state_dir, "pages"))), timeout=3.0)
 # Press 'q' to quit cleanly
 os.write(master, b"q")
 try:
@@ -853,7 +855,7 @@ except subprocess.TimeoutExpired:
     proc.terminate()
     rc = proc.wait(timeout=2.0)
 os.close(master)
-print(f"ok1={int(ok1)} w_off={int(ok_w_off)} force={int(ok_force)} only_latest={int(only_latest)} w_on={int(ok_w_on)} ctx_before={int(ctx_before)} clear={int(ok_clear)} rc={rc}")
+print(f"ok1={int(ok1)} w_off={int(ok_w_off)} force={int(ok_force)} only_latest={int(only_latest)} w_on={int(ok_w_on)} ctx_before={int(ctx_before)} pages_before={int(pages_before)} clear={int(ok_clear)} rc={rc}")
 PY
 )
 assert_contains "$PTY_RES" "ok1=1" "PTY live-review completes initial solve and settles idle"
@@ -861,7 +863,7 @@ assert_contains "$PTY_RES" "w_off=1" "pressing [w] toggles web lookup OFF immedi
 assert_contains "$PTY_RES" "force=1" "pressing [Space] forces immediate solve during long interval"
 assert_contains "$PTY_RES" "only_latest=1" "terminal clears prior answer so ONLY the present solution is visible"
 assert_contains "$PTY_RES" "w_on=1" "pressing [w] again toggles web lookup back ON immediately"
-assert_contains "$PTY_RES" "ctx_before=1 clear=1" "pressing [c] clears saved problem_context.md"
+assert_contains "$PTY_RES" "ctx_before=1 pages_before=1 clear=1" "pressing [c] clears saved problem_context.md and rolling pages"
 assert_contains "$PTY_RES" "rc=0" "pressing [q] exits live-review cleanly with code 0"
 CALL1_LINE=$(grep '^CALL 1:' "$T6P_ARGS_LOG" 2>/dev/null || true)
 CALL2_LINE=$(grep '^CALL 2:' "$T6P_ARGS_LOG" 2>/dev/null || true)
@@ -995,6 +997,179 @@ assert_eq "$ANS_OCC" "1" "live-review streams answer only ONCE while screen is u
 sleep 0.2
 STRAY7=$(pgrep -fl "$TMPBASE" 2>/dev/null || true)
 assert_eq "$STRAY7" "" "no stray background processes left after Task 7"
+
+echo
+echo "=== Task 8: multi-scroll accumulation, completeness gate & auto-reset ==="
+
+swift - "$TMPBASE" <<'SWIFT'
+import Foundation
+import AppKit
+
+func renderPage(path: String, title: String, lines: [String]) {
+    let w = 900, h = 700
+    let rep = NSBitmapImageRep(
+        bitmapDataPlanes: nil, pixelsWide: w, pixelsHigh: h,
+        bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
+        colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0
+    )!
+    NSGraphicsContext.saveGraphicsState()
+    NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: rep)
+    NSColor.white.setFill()
+    NSRect(x: 0, y: 0, width: w, height: h).fill()
+    let titleAttrs: [NSAttributedString.Key: Any] = [
+        .font: NSFont.systemFont(ofSize: 22, weight: .bold),
+        .foregroundColor: NSColor.black
+    ]
+    let bodyAttrs: [NSAttributedString.Key: Any] = [
+        .font: NSFont.monospacedSystemFont(ofSize: 17, weight: .regular),
+        .foregroundColor: NSColor.black
+    ]
+    NSString(string: title).draw(at: NSPoint(x: 30, y: CGFloat(h - 50)), withAttributes: titleAttrs)
+    for (i, line) in lines.enumerated() {
+        NSString(string: line).draw(at: NSPoint(x: 30, y: CGFloat(h - 95 - i * 28)), withAttributes: bodyAttrs)
+    }
+    NSGraphicsContext.restoreGraphicsState()
+    try! rep.representation(using: .png, properties: [:])!.write(to: URL(fileURLWithPath: path))
+}
+
+let b = CommandLine.arguments[1]
+renderPage(path: "\(b)/scroll_p1.png", title: "Data Quality Work Sample — Part 1", lines: [
+    "Dataset: Veterinary antimicrobial sales (kg active substance)",
+    "R1 Alpha Cattle 10",
+    "R2 Alpha Pigs 5",
+    "R3 Alpha Pigs 5 (duplicate of R2)",
+    "R7 Delta Pigs 3 (see denominator table below...)"
+])
+renderPage(path: "\(b)/scroll_p2.png", title: "Denominator Lookup Table", lines: [
+    "Country  Year  Species  PCU_kg",
+    "Alpha    2025  Cattle   1000",
+    "Alpha    2025  Pigs     500",
+    "Delta    2025  Pigs     MISSING"
+])
+renderPage(path: "\(b)/scroll_p3.png", title: "Questions & Deliverables", lines: [
+    "1. Compute cleaned kg per PCU for Alpha/Cattle and Alpha/Pigs.",
+    "2. Explain what to do with Delta/Pigs given MISSING denominator."
+])
+renderPage(path: "\(b)/unrelated_quiz.png", title: "World Geography Trivia", lines: [
+    "Which river flows through Vienna, Budapest, and Belgrade?",
+    "(A) Rhine   (B) Danube   (C) Elbe   (D) Po"
+])
+SWIFT
+
+# 8a. solver_stream.py accepts repeatable --image flags and labels them chronologically
+T8_DIR="$TMPBASE/t8_multi"
+mkdir -p "$T8_DIR"
+printf 'You are a solver.' > "$T8_DIR/sys.txt"
+printf 'Solve across all pages.' > "$T8_DIR/usr.txt"
+STUB_STDIN_CAPTURE="$T8_DIR/stdin.json" STUB_ARGS_CAPTURE="$T8_DIR/args.txt" \
+  python3 -I "$ROOT/solver_stream.py" \
+    --claude "$STREAM_CLAUDE" \
+    --model claude-sonnet-5-5 \
+    --image "$TMPBASE/scroll_p1.png" \
+    --image "$TMPBASE/scroll_p2.png" \
+    --image "$TMPBASE/scroll_p3.png" \
+    --system-prompt-file "$T8_DIR/sys.txt" \
+    --prompt-file "$T8_DIR/usr.txt" \
+    --web 0 \
+    --reply-out "$T8_DIR/reply.txt" \
+    --context-out "$T8_DIR/ctx.txt" \
+    --err-out "$T8_DIR/err.txt" >/dev/null 2>&1
+assert_eq "$?" "0" "solver_stream.py accepts multiple --image flags"
+IMG_COUNT=$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(sum(1 for b in d["message"]["content"] if b.get("type")=="image"))' "$T8_DIR/stdin.json" 2>/dev/null || echo 0)
+assert_eq "$IMG_COUNT" "3" "solver_stream.py embeds all 3 images in one stream-json payload"
+assert_contains "$(cat "$T8_DIR/stdin.json" 2>/dev/null)" "Screenshot 1 of 3" "solver_stream.py labels Screenshot 1 of 3"
+assert_contains "$(cat "$T8_DIR/stdin.json" 2>/dev/null)" "Screenshot 3 of 3" "solver_stream.py labels Screenshot 3 of 3"
+
+# 8b. Scroll-settle debounce accumulates 3 rapid scrolls into ONE single 3-image Claude call
+T8S_STATE="$TMPBASE/t8s_state"
+T8S_OUT="$TMPBASE/t8s_out"
+T8S_CALLS="$TMPBASE/t8s_calls"
+T8S_SEQ_IDX="$TMPBASE/t8s_seq_idx"
+echo 0 > "$T8S_CALLS"
+echo 0 > "$T8S_SEQ_IDX"
+
+T8S_CAP="$TMPBASE/t8s-capture"
+cat > "$T8S_CAP" <<EOF
+#!/bin/bash
+idx=\$(cat "$T8S_SEQ_IDX")
+idx=\$((idx + 1))
+echo "\$idx" > "$T8S_SEQ_IDX"
+case "\$idx" in
+  1) cp "$TMPBASE/scroll_p1.png" "\$1" ;;
+  2) cp "$TMPBASE/scroll_p2.png" "\$1" ;;
+  *) cp "$TMPBASE/scroll_p3.png" "\$1" ;;
+esac
+EOF
+chmod +x "$T8S_CAP"
+
+T8S_CLAUDE="$TMPBASE/t8s-claude"
+cat > "$T8S_CLAUDE" <<EOF
+#!/bin/bash
+cat > "$TMPBASE/t8s_stdin.json"
+c=\$(cat "$T8S_CALLS")
+echo \$((c + 1)) > "$T8S_CALLS"
+echo "Complete solution using all 3 scrolled pages."
+EOF
+chmod +x "$T8S_CLAUDE"
+
+STATE_DIR="$T8S_STATE" OUT_DIR="$T8S_OUT" CAPTURE_CMD="$T8S_CAP" \
+  SCROLL_SETTLE=0.25 CLAUDE_BIN="$T8S_CLAUDE" NO_NOTIFY=1 "$ROOT/review.sh"
+assert_eq "$(cat "$T8S_CALLS")" "1" "3 rapid scrolls during settle trigger only ONE Claude call"
+T8S_IMGS=$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(sum(1 for b in d["message"]["content"] if b.get("type")=="image"))' "$TMPBASE/t8s_stdin.json" 2>/dev/null || echo 0)
+assert_eq "$T8S_IMGS" "3" "scroll-settle sends all 3 scrolled pages together in that single call"
+
+# 8c. Completeness gate: ⬇ Scroll down sets awaiting_more=1 & preserves Page 1 across disjoint Page 2;
+#     then after complete answer (awaiting_more=0), switching to an unrelated quiz auto-resets pages to 1.
+T8C_STATE="$TMPBASE/t8c_state"
+T8C_OUT="$TMPBASE/t8c_out"
+T8C_STEP="$TMPBASE/t8c_step"
+echo 0 > "$T8C_STEP"
+T8C_CLAUDE="$TMPBASE/t8c-claude"
+cat > "$T8C_CLAUDE" <<EOF
+#!/bin/bash
+s=\$(cat "$T8C_STEP")
+s=\$((s + 1))
+echo "\$s" > "$T8C_STEP"
+cat > "$TMPBASE/t8c_stdin_\${s}.json"
+printf '%s\n' "\$*" > "$TMPBASE/t8c_args_\${s}.txt"
+if [ "\$s" = "1" ]; then
+  cat <<'REPLY'
+⬇ Scroll down to capture the rest
+Missing: denominator lookup table and questions.
+(Press Space to solve now with what's captured)
+<<<CONTEXT
+- Part 1 captured (R1-R3, R7 truncated)
+CONTEXT>>>
+REPLY
+else
+  echo "Final complete solution for call \$s."
+fi
+EOF
+chmod +x "$T8C_CLAUDE"
+
+# Step 1: Part 1 -> Claude replies ⬇ Scroll down -> awaiting_more=1
+STATE_DIR="$T8C_STATE" OUT_DIR="$T8C_OUT" CAPTURE_IMAGE="$TMPBASE/scroll_p1.png" \
+  SCROLL_SETTLE=0 CLAUDE_BIN="$T8C_CLAUDE" NO_NOTIFY=1 "$ROOT/review.sh"
+assert_eq "$(cat "$T8C_STATE/awaiting_more" 2>/dev/null)" "1" "⬇ Scroll down reply sets state/awaiting_more=1"
+assert_contains "$(cat "$TMPBASE/t8c_args_1.txt" 2>/dev/null)" "COMPLETENESS CHECK" "automatic run includes completeness-check instruction"
+
+# Step 2: Scroll to Part 2 (disjoint numeric table!) -> Page 1 MUST be preserved (2 images sent!) & awaiting_more clears to 0
+STATE_DIR="$T8C_STATE" OUT_DIR="$T8C_OUT" CAPTURE_IMAGE="$TMPBASE/scroll_p2.png" \
+  SCROLL_SETTLE=0 CLAUDE_BIN="$T8C_CLAUDE" NO_NOTIFY=1 "$ROOT/review.sh"
+T8C_IMGS2=$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(sum(1 for b in d["message"]["content"] if b.get("type")=="image"))' "$TMPBASE/t8c_stdin_2.json" 2>/dev/null || echo 0)
+assert_eq "$T8C_IMGS2" "2" "awaiting_more=1 preserves Page 1 and sends both Page 1 + disjoint Page 2"
+assert_eq "$(cat "$T8C_STATE/awaiting_more" 2>/dev/null)" "0" "complete solution resets state/awaiting_more=0"
+
+# Step 3: Switch to completely unrelated geography quiz -> pages auto-reset to 1 image!
+STATE_DIR="$T8C_STATE" OUT_DIR="$T8C_OUT" CAPTURE_IMAGE="$TMPBASE/unrelated_quiz.png" \
+  SCROLL_SETTLE=0 CLAUDE_BIN="$T8C_CLAUDE" NO_NOTIFY=1 "$ROOT/review.sh"
+T8C_IMGS3=$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(sum(1 for b in d["message"]["content"] if b.get("type")=="image"))' "$TMPBASE/t8c_stdin_3.json" 2>/dev/null || echo 0)
+assert_eq "$T8C_IMGS3" "1" "switching to unrelated problem auto-resets page buffer to 1 image"
+
+# Step 4: FORCE_REVIEW=1 tells Claude to solve immediately without asking to scroll
+STATE_DIR="$T8C_STATE" OUT_DIR="$T8C_OUT" CAPTURE_IMAGE="$TMPBASE/unrelated_quiz.png" \
+  FORCE_REVIEW=1 SCROLL_SETTLE=0 CLAUDE_BIN="$T8C_CLAUDE" NO_NOTIFY=1 "$ROOT/review.sh"
+assert_contains "$(cat "$TMPBASE/t8c_args_4.txt" 2>/dev/null)" "Do NOT ask to scroll down" "FORCE_REVIEW=1 instructs Claude to solve immediately without asking to scroll"
 
 echo
 echo "Summary: $PASS passed, $FAIL failed"

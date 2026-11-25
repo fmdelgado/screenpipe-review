@@ -2,7 +2,12 @@
 
 Live universal on-screen problem solver for a mirrored window (`MeowDisplay`) or a connected monitor (built-in Mac display or external screen). Every 2s it captures the target window or display, checks for meaningful visual/text changes (ignoring clocks, timers, cursor blink, and OCR jitter), and replaces the terminal view with **only the direct solution to the present question on screen** using the local Claude Code CLI (subscription auth, no API key). Full history is still kept quietly on disk in `output/history.md`.
 
-Works for any kind of challenge on screen — multiple-choice quizzes, math/logic/visual puzzles, coding problems (empty editors or debugging existing code), stack traces/CLI errors, SQL/regex/formulas, diagrams/charts, interview/open-ended questions, forms, and everyday screen tasks.
+Works for any kind of challenge on screen — multiple-choice quizzes, math/logic/visual puzzles, coding problems (empty editors or debugging existing code), stack traces/CLI errors, SQL/regex/formulas, diagrams/charts, long multi-scroll data-quality/case work samples, interview/open-ended questions, forms, and everyday screen tasks.
+
+### Multi-scroll problems (long work samples & specs)
+- **Automatic scroll-settle capture:** when you scroll through a long problem, `live-review` waits `1.2s` for scrolling to settle and collects consecutive views into a rolling multi-image batch (up to 5 pages), sending them together in **one** Claude call at full visual fidelity.
+- **Completeness gate:** if critical parts of a problem are visibly cut off (e.g., a truncated table row, a referenced denominator table, or unseen questions below), the solver briefly prompts `⬇ Scroll down to capture the rest` instead of guessing, keeps your captured pages buffered, and delivers the complete solution once you scroll down. Press `Space` anytime to force an immediate answer with what's captured so far.
+- Switching to an unrelated problem automatically resets the page buffer (or press `c` anytime).
 
 ## Setup
 ```bash

@@ -122,7 +122,7 @@ done
 ensure_helper
 mkdir -p "$OUT" "$STATE"
 touch "$OUT/feed.log" "$STATE/run.log"
-rm -rf "$STATE/lock.d" "$STATE/last_reviewed.txt" "$STATE/last_reviewed.png" "$STATE/streaming"
+rm -rf "$STATE/lock.d" "$STATE/last_reviewed.txt" "$STATE/last_reviewed.png" "$STATE/streaming" "$STATE/pages" "$STATE/awaiting_more"
 
 [ "$WEB_INIT" = "0" ] || WEB_INIT="1"
 echo "$WEB_INIT" > "$STATE/web_enabled"
@@ -231,7 +231,7 @@ toggle_pause() {
 }
 
 clear_session() {
-  rm -f "$OUT/problem_context.md" "$OUT/history.md" "$STATE/last_reviewed.txt" "$STATE/last_reviewed.png"
+  rm -rf "$OUT/problem_context.md" "$OUT/history.md" "$STATE/last_reviewed.txt" "$STATE/last_reviewed.png" "$STATE/pages" "$STATE/awaiting_more"
   print_header
   if is_paused; then
     draw_status "⏸ paused"
@@ -348,7 +348,7 @@ while true; do
       if [ ! -f "$STATE/streaming" ]; then
         CUR_ST=$(cat "$STATE/status" 2>/dev/null || echo "")
         case "$CUR_ST" in
-          "solving..."|"searching web...") draw_status "◌ $CUR_ST" ;;
+          "solving..."|"searching web..."|"capturing"*) draw_status "◌ $CUR_ST" ;;
         esac
       fi
       key=""

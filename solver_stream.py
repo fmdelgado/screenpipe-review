@@ -149,7 +149,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--claude", required=True)
     ap.add_argument("--model", required=True)
-    ap.add_argument("--image", default="")
+    ap.add_argument("--image", action="append", default=[])
     ap.add_argument("--system-prompt-file", required=True)
     ap.add_argument("--prompt-file", required=True)
     ap.add_argument("--web", default="1")
@@ -176,10 +176,20 @@ def main():
         prompt_text = f.read()
 
     content = []
-    if args.image and os.path.isfile(args.image):
-        lower = args.image.lower()
+    valid_images = [p for p in (args.image or []) if p and os.path.isfile(p)]
+    total_imgs = len(valid_images)
+    for idx, img_path in enumerate(valid_images, start=1):
+        if total_imgs > 1:
+            if idx == 1:
+                label = f"Screenshot {idx} of {total_imgs} (earlier scroll):"
+            elif idx == total_imgs:
+                label = f"Screenshot {idx} of {total_imgs} (current view):"
+            else:
+                label = f"Screenshot {idx} of {total_imgs}:"
+            content.append({"type": "text", "text": label})
+        lower = img_path.lower()
         media_type = "image/jpeg" if lower.endswith((".jpg", ".jpeg")) else "image/png"
-        with open(args.image, "rb") as f:
+        with open(img_path, "rb") as f:
             b64 = base64.b64encode(f.read()).decode("ascii")
         content.append(
             {
